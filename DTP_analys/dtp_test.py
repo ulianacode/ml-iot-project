@@ -7,29 +7,7 @@ from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 from sklearn.utils import resample
-
-df = pd.read_csv('dtp201804-1.csv', encoding='cp1251', sep=';')
-
-df_moscow = df[df['reg_name'].str.contains('Московская')].copy()
-
-le = LabelEncoder()
-df_moscow['road_type_encoded'] = le.fit_transform(df_moscow['road_type'])
-df_moscow['crash_type_encoded'] = le.fit_transform(df_moscow['crash_type_name'])
-df_moscow['crash_reason_encoded'] = le.fit_transform(df_moscow['crash_reason'])
-
-df_moscow['is_dangerous'] = (df_moscow['fatalities_amount'] > 0).astype(int)
-
-features = [
-    'road_type_encoded', 'crash_type_encoded', 'crash_reason_encoded',
-    'vehicles_amount', 'participants_amount', 'latitude', 'longitude'
-]
-X = df_moscow[features].values
-y = df_moscow['is_dangerous'].values
-
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
-X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.3, random_state=42)
-
+import folium
 
 class MyRandomForestClassifier:
     def __init__(self, n_estimators=50, max_features='sqrt', max_depth=5):
@@ -123,20 +101,6 @@ class MyRandomForestClassifier:
 
         return np.mean(np.array(final_preds) == np.array(true_y))
 
-
-# Обучение и предсказание
-forest = MyRandomForestClassifier(n_estimators=50, max_depth=5)
-forest.fit(X_train, y_train)
-y_pred = forest.predict(X_test)
-
-print("=== Classification Report ===")
-print(classification_report(y_test, y_pred, zero_division=1))
-
-print("=== OOB Score ===")
-print("OOB Accuracy:", forest.oob_score(X_train, y_train))
-
-
-#  Визуализация одного дерева
 def visualize_tree(model, feature_names, tree_index=0):
     plt.figure(figsize=(20, 10))
     plot_tree(model.trees[tree_index],
@@ -147,4 +111,88 @@ def visualize_tree(model, feature_names, tree_index=0):
     plt.title(f"Визуализация дерева №{tree_index + 1}")
     plt.show()
 
-visualize_tree(forest, features)
+# Загрузка и предварительная обработка данных
+df = pd.read_csv('dtp201804-1.csv', encoding='cp1251', sep=';')
+df_moscow = df[df['reg_name'].str.contains('Московская')].copy()
+
+# Кодирование категориальных признаков
+le = LabelEncoder()
+df_moscow['road_type_encoded'] = le.fit_transform(df_moscow['road_type'])
+df_moscow['crash_type_encoded'] = le.fit_transform(df_moscow['crash_type_name'])
+df_moscow['crash_reason_encoded'] = le.fit_transform(df_moscow['crash_reason'])
+
+# Группировка данных по участкам дорог
+df_moscow['lat_rounded'] = df_moscow['latitude'].round(2)
+df_moscow['lon_rounded'] = df_moscow['longitude'].round(2)
+road_segments = df_moscow.groupby(['road_type_encoded', 'lat_rounded', 'lon_rounded'])
+
+# Создание DataFrame с агрегированными данными по участкам дорог
+road_stats = road_segments.agg({
+    'fatalities_amount': 'sum',
+    'participants_amount': 'sum',
+    'vehicles_amount': 'sum',
+    'crash_type_encoded': lambda x: Counter(x).most_common(1)[0][0],
+    'crash_reason_encoded': lambda x: Counter(x).most_common(1)[0][0]
+}).reset_index()
+
+# Добавление количества ДТП на участке
+road_stats['crash_count'] = road_segments.size().values
+
+# Определение опасности дороги
+road_stats['is_dangerous_road'] = (
+    (road_stats['fatalities_amount'] > 0) |
+    (road_stats['crash_count'] > 3)
+).astype(int)
+
+# Подготовка признаков и целевой переменной
+features_road = [
+    'road_type_encoded', 'crash_type_encoded', 'crash_reason_encoded',
+    'vehicles_amount', 'participants_amount', 'crash_count', 'lat_rounded', 'lon_rounded'
+]
+
+X_road = road_stats[features_road].values
+y_road = road_stats['is_dangerous_road'].values
+
+
+scaler = StandardScaler()
+X_road_scaled = scaler.fit_transform(X_road)
+X_train_road, X_test_road, y_train_road, y_test_road = train_test_split(
+    X_road_scaled, y_road, test_size=0.3, random_state=42
+)
+
+
+forest_road = MyRandomForestClassifier(n_estimators=50, max_depth=5)
+forest_road.fit(X_train_road, y_train_road)
+y_pred_road = forest_road.predict(X_test_road)
+
+
+print("=== Classification Report (Road Danger) ===")
+print(classification_report(y_test_road, y_pred_road, zero_division=1))
+
+print("=== OOB Score ===")
+print("OOB Accuracy:", forest_road.oob_score(X_train_road, y_train_road))
+
+visualize_tree(forest_road, features_road)
+
+# Визуализация опасных участков на карте
+dangerous_roads = road_stats[road_stats['is_dangerous_road'] == 1]
+moscow_center = [df_moscow['latitude'].mean(), df_moscow['longitude'].mean()]
+
+map_roads = folium.Map(location=moscow_center, zoom_start=11)
+for _, row in dangerous_roads.iterrows():
+    folium.CircleMarker(
+        location=[row['lat_rounded'], row['lon_rounded']],
+        radius=5 + row['crash_count']/2,
+        color='red',
+        fill=True,
+        popup=f"""
+        Участок дороги:
+        Тип: {row['road_type_encoded']}
+        ДТП: {row['crash_count']}
+        Погибших: {row['fatalities_amount']}
+        Участников: {row['participants_amount']}
+        """
+    ).add_to(map_roads)
+
+map_roads.save("dangerous_roads_moscow.html")
+print("Карта опасных участков сохранена как 'dangerous_roads_moscow.html'")
